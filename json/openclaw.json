@@ -1,0 +1,46 @@
+{
+    "name": "OpenClaw",
+    "slug": "openclaw",
+    "categories": [
+        22,
+        20
+    ],
+    "date_created": "2026-06-22",
+    "type": "ct",
+    "updateable": true,
+    "privileged": false,
+    "has_arm": false,
+    "interface_port": 18789,
+    "documentation": "https://docs.openclaw.ai/",
+    "website": "https://openclaw.ai/",
+    "logo": "https://cdn.jsdelivr.net/gh/selfhst/icons@main/webp/openclaw.webp",
+    "description": "Self-hosted gateway that bridges chat platforms (Discord, Telegram, WhatsApp, and more) to AI agents, with a local Control UI.",
+    "install_methods": [
+        {
+            "type": "default",
+            "script": "ct/openclaw.sh",
+            "config_path": "/home/openclaw/.openclaw",
+            "resources": {
+                "cpu": 2,
+                "ram": 2048,
+                "hdd": 8,
+                "os": "Debian",
+                "version": "13"
+            }
+        }
+    ],
+    "default_credentials": {
+        "username": null,
+        "password": null
+    },
+    "notes": [
+        {
+            "text": "The Control UI listens on 127.0.0.1:18789 (local only). Reach it via SSH tunnel (ssh -L 18789:127.0.0.1:18789 root@<ip>) or Tailscale.",
+            "type": "info"
+        },
+        {
+            "text": "Onboarding is skipped on install. Run 'openclaw onboard' as the openclaw user (su - openclaw) or use the dashboard to connect channels.",
+            "type": "info"
+        }
+    ]
+}
