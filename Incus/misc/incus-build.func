@@ -1,0 +1,846 @@
+#!/usr/bin/env bash
+# Copyright (c) 2021-2026 community-scripts ORG
+# Author: MickLesk
+# License: MIT | https://github.com/community-scripts/ProxmoxVED/raw/main/LICENSE
+
+# ==============================================================================
+# INCUS-BUILD.FUNC - INCUS CONTAINER BUILD & CONFIGURATION
+# ==============================================================================
+# Loads incus-core.func AND incus-tools.func so ALL functions
+# (msg_info, msg_ok, header_info, setup_*, etc.) work on the HOST too.
+# ==============================================================================
+
+[[ -n "${_INCUS_BUILD_FUNC_LOADED:-}" ]] && return
+_INCUS_BUILD_FUNC_LOADED=1
+
+INCUS_COMMUNITY_SCRIPTS_URL="${COMMUNITY_SCRIPTS_URL:-https://raw.githubusercontent.com/community-scripts/ProxmoxVED/main}"
+
+# --- LOAD incus-core.func (incus_* prefixed functions) ---
+if [[ -z "${_INCUS_CORE_FUNC_LOADED:-}" ]]; then
+  source <(curl -fsSL "$INCUS_COMMUNITY_SCRIPTS_URL/Incus/misc/incus-core.func")
+  load_incus_functions
+  incus_catch_errors
+fi
+
+# --- LOAD incus-tools.func (bare function stubs: msg_info, header_info, etc.) ---
+if [[ -z "${_INCUS_TOOLS_FUNC_LOADED:-}" ]]; then
+  source <(curl -fsSL "$INCUS_COMMUNITY_SCRIPTS_URL/Incus/misc/incus-tools.func")
+  incus_install_compat_aliases
+fi
+
+# ==============================================================================
+# SECTION 1: INITIALIZATION
+# ==============================================================================
+
+incus_variables() {
+  NSAPP=$(echo "${APP,,}" | tr -d ' ')
+  var_install="${NSAPP}-install"
+  INTEGER='^[0-9]+([.][0-9]+)?$'
+  HOST_NAME=$(hostname)
+  DIAGNOSTICS="yes"
+  METHOD="default"
+  RANDOM_UUID="$(cat /proc/sys/kernel/random/uuid)"
+  SESSION_ID="${RANDOM_UUID:0:8}"
+  EXECUTION_ID="${EXECUTION_ID:-$RANDOM_UUID}"
+  INCUS_BUILD_LOG="/tmp/incus-create-${SESSION_ID}.log"
+  INCUS_INSTALL_LOG="/tmp/incus-install-${SESSION_ID}.log"
+  _INCUS_HOST_LOGFILE="$INCUS_BUILD_LOG"
+  if [[ -n "${var_cpu:-}" && "${var_cpu}" =~ ^[0-9]+$ ]]; then export APP_DEFAULT_CPU="${var_cpu}"; fi
+  if [[ -n "${var_ram:-}" && "${var_ram}" =~ ^[0-9]+$ ]]; then export APP_DEFAULT_RAM="${var_ram}"; fi
+  if [[ -n "${var_disk:-}" && "${var_disk}" =~ ^[0-9]+$ ]]; then export APP_DEFAULT_DISK="${var_disk}"; fi
+}
+
+# ==============================================================================
+# SECTION 2: PRE-FLIGHT
+# ==============================================================================
+
+incus_run_preflight() {
+  echo -e "${INFO}${BOLD}${DGN} Running Incus pre-flight checks...${CL}"
+  echo ""
+  command -v incus &>/dev/null || { msg_error "Incus not installed"; exit 1; }
+  incus info &>/dev/null || { msg_error "Incus daemon not accessible"; exit 1; }
+  msg_ok "Incus daemon running"
+  local pool_count; pool_count=$(incus storage list -f csv,noheader 2>/dev/null | wc -l)
+  [[ "$pool_count" -eq 0 ]] && { msg_error "No Incus storage pools found"; exit 1; }
+  msg_ok "Storage pools available (${pool_count})"
+  local net_count; net_count=$(incus network list -f csv,noheader 2>/dev/null | grep -cv '^lo$')
+  if [[ "$net_count" -eq 0 ]]; then
+    msg_warn "No networks found, creating incusbr0..."
+    incus network create incusbr0 2>/dev/null || { msg_error "Failed to create incusbr0"; exit 1; }
+    msg_ok "Created incusbr0"
+  else
+    msg_ok "Networks available (${net_count})"
+  fi
+  getent hosts images.linuxcontainers.org &>/dev/null && msg_ok "DNS OK" || msg_warn "DNS issue"
+  echo ""
+  msg_ok "All pre-flight checks passed"
+  sleep 2
+}
+
+incus_ensure_whiptail_host() {
+  command -v whiptail >/dev/null 2>&1 && return 0
+  if command -v apt >/dev/null 2>&1; then
+    msg_info "Installing whiptail on host"
+    incus_silent apt update
+    incus_silent apt install -y whiptail
+    msg_ok "Installed whiptail"
+  fi
+}
+
+incus_can_use_whiptail() {
+  command -v whiptail >/dev/null 2>&1 || return 1
+  [[ -t 0 && -t 1 ]] || return 1
+  [[ -n "${TERM:-}" && "${TERM}" != "dumb" ]] || return 1
+  return 0
+}
+
+incus_prompt_input() {
+  local title="${1:-INPUT}"
+  local label="${2:-Enter value}"
+  local default="${3:-}"
+  if incus_can_use_whiptail; then
+    whiptail --backtitle "Incus Helper Scripts" --title "$title" --inputbox "$label" 10 72 "$default" 3>&1 1>&2 2>&3
+  else
+    prompt_input "$label" "$default" 600
+  fi
+}
+
+incus_prompt_confirm() {
+  local title="${1:-CONFIRM}"
+  local label="${2:-Proceed?}"
+  local default="${3:-y}"
+  if incus_can_use_whiptail; then
+    if [[ "$default" == "y" ]]; then
+      whiptail --backtitle "Incus Helper Scripts" --title "$title" --yesno "$label" 10 72
+    else
+      whiptail --backtitle "Incus Helper Scripts" --defaultno --title "$title" --yesno "$label" 10 72
+    fi
+  else
+    prompt_confirm "$label" "$default" 180
+  fi
+}
+
+incus_pick_default_network() {
+  local nets
+  nets=$(incus network list -f csv,noheader 2>/dev/null | cut -d, -f1 | sed '/^\s*$/d' | grep -v '^lo$' || true)
+  [[ -z "$nets" ]] && { echo "incusbr0"; return; }
+
+  # Prefer physical/macvlan/sriov networks first (typically LAN-reachable).
+  local n cfg
+  while IFS= read -r n; do
+    [[ -z "$n" || "$n" == "incusbr0" ]] && continue
+    cfg=$(incus network show "$n" 2>/dev/null || true)
+    if echo "$cfg" | grep -qE '^type:\s*(physical|macvlan|sriov)$'; then
+      echo "$n"
+      return
+    fi
+  done <<<"$nets"
+
+  # Then prefer bridge networks without NAT.
+  while IFS= read -r n; do
+    [[ -z "$n" || "$n" == "incusbr0" ]] && continue
+    cfg=$(incus network show "$n" 2>/dev/null || true)
+    if echo "$cfg" | grep -q '^type:\s*bridge$' &&
+      ! echo "$cfg" | grep -qE 'ipv4\.nat:\s*"true"|ipv6\.nat:\s*"true"'; then
+      echo "$n"
+      return
+    fi
+  done <<<"$nets"
+
+  # Fallback: any non-incusbr0 network, else incusbr0.
+  while IFS= read -r n; do
+    [[ -n "$n" && "$n" != "incusbr0" ]] && { echo "$n"; return; }
+  done <<<"$nets"
+  echo "incusbr0"
+}
+
+incus_select_network() {
+  local preferred="${1:-$(incus_pick_default_network)}"
+  local nets
+  nets=$(incus network list -f csv,noheader 2>/dev/null | cut -d, -f1 | sed '/^\s*$/d' | grep -v '^lo$' || true)
+  [[ -z "$nets" ]] && { echo "incusbr0"; return; }
+
+  # Non-interactive/default mode: return preferred immediately.
+  if [[ ! -t 0 || "${MODE:-default}" != "advanced" ]]; then
+    echo "$preferred"
+    return
+  fi
+
+  if incus_can_use_whiptail; then
+    local options=()
+    local n
+    while IFS= read -r n; do
+      [[ -z "$n" ]] && continue
+      options+=("$n" "Incus network")
+    done <<<"$nets"
+    local choice
+    choice=$(whiptail --backtitle "Incus Helper Scripts" --title "NETWORK BRIDGE" --menu "Select network bridge" 18 72 8 "${options[@]}" 3>&1 1>&2 2>&3) || true
+    if [[ -n "$choice" ]]; then
+      echo "$choice"
+      return
+    fi
+  else
+    local n
+    while IFS= read -r n; do
+      [[ -z "$n" ]] && continue
+      if incus_prompt_confirm "NETWORK BRIDGE" "Use network '${n}'?" "$([[ "$n" == "$preferred" ]] && echo y || echo n)"; then
+        echo "$n"
+        return
+      fi
+    done <<<"$nets"
+  fi
+
+  echo "$preferred"
+}
+
+# ==============================================================================
+# SECTION 3: CONTAINER CREATION
+# ==============================================================================
+
+incus_base_settings() {
+  local final_disk="${var_disk:-4}" final_cpu="${var_cpu:-1}" final_ram="${var_ram:-1024}"
+  [[ -n "${APP_DEFAULT_DISK:-}" && "${APP_DEFAULT_DISK}" -gt "$final_disk" ]] && final_disk="${APP_DEFAULT_DISK}"
+  [[ -n "${APP_DEFAULT_CPU:-}" && "${APP_DEFAULT_CPU}" -gt "$final_cpu" ]] && final_cpu="${APP_DEFAULT_CPU}"
+  [[ -n "${APP_DEFAULT_RAM:-}" && "${APP_DEFAULT_RAM}" -gt "$final_ram" ]] && final_ram="${APP_DEFAULT_RAM}"
+  DISK_SIZE="${final_disk}"; CORE_COUNT="${final_cpu}"; RAM_SIZE="${final_ram}"
+  VERBOSE=${var_verbose:-"no"}
+  local requested_name="${var_hostname:-$NSAPP}"
+  requested_name=$(echo "${requested_name,,}" | tr -d ' ' | tr '_' '-')
+  CT_NAME=$(incus_get_next_name "$requested_name")
+  BRG=${var_brg:-""}; NET=${var_net:-"dhcp"}; IPV6_ADDR=${var_ip6:-"auto"}; GATE=${var_gateway:-""}; MAC=${var_mac:-""}
+  [[ -z "$BRG" ]] && BRG="$(incus_pick_default_network)"
+  VLAN_TAG=${var_vlan:-""}; MTU=${var_mtu:-""}
+  SSH=${var_ssh:-"no"}; SSH_AUTHORIZED_KEY=${var_ssh_authorized_key:-""}
+  ENABLE_NESTING=${var_nesting:-"1"}; ENABLE_FUSE=${var_fuse:-"no"}; ENABLE_TUN=${var_tun:-"no"}; ENABLE_GPU=${var_gpu:-"no"}; UNPRIVILEGED=${var_unprivileged:-"1"}
+  IMAGE_OS="${var_os:-debian}"; IMAGE_VERSION="${var_version:-13}"
+  TAGS="${var_tags:-}"
+  PROFILE="${var_profile:-default}"
+  STORAGE_POOL="${var_storage:-}"
+  [[ -z "$STORAGE_POOL" ]] && STORAGE_POOL=$(incus storage list -f csv,noheader 2>/dev/null | head -1 | cut -d, -f1)
+}
+
+incus_echo_config() {
+  echo -e "${BL}╔══════════════════════════════════════════════════════════════╗${CL}"
+  echo -e "${BL}║${CL}  ${BOLD}Incus Container Configuration${CL}"
+  echo -e "${BL}╠══════════════════════════════════════════════════════════════╣${CL}"
+  echo -e "${BL}║${CL}  ${CONTAINERID}Name: ${GN}${CT_NAME}${CL}"
+  echo -e "${BL}║${CL}  ${CONTAINERTYPE}Image: ${GN}${IMAGE_OS}-${IMAGE_VERSION}${CL}"
+  echo -e "${BL}║${CL}  ${CPUCORE}CPU: ${GN}${CORE_COUNT}${CL}   ${RAMSIZE}RAM: ${GN}${RAM_SIZE} MiB${CL}   ${DISKSIZE}Disk: ${GN}${DISK_SIZE} GB${CL}"
+  echo -e "${BL}║${CL}  ${BRIDGE}Network: ${GN}${BRG}${CL}   ${NETWORK}IP: ${GN}${NET}${CL}"
+  echo -e "${BL}║${CL}  Profile: ${GN}${PROFILE}${CL}   Privileged: ${GN}$([[ \"${UNPRIVILEGED}\" == \"1\" ]] && echo no || echo yes)${CL}"
+  [[ -n "${MAC}" || -n "${VLAN_TAG}" || -n "${MTU}" ]] && echo -e "${BL}║${CL}  MAC: ${GN}${MAC:-auto}${CL}   VLAN: ${GN}${VLAN_TAG:-none}${CL}   MTU: ${GN}${MTU:-default}${CL}"
+  [[ -n "${TAGS}" ]] && echo -e "${BL}║${CL}  Tags: ${GN}${TAGS}${CL}"
+  [[ "${BRG}" == "incusbr0" ]] && echo -e "${BL}║${CL}  ${YW}Hint: incusbr0 ist NAT-intern (oft nicht direkt aus LAN erreichbar).${CL}"
+  echo -e "${BL}╚══════════════════════════════════════════════════════════════╝${CL}"
+}
+
+incus_create_container() {
+  local image_name="images:${IMAGE_OS}/${IMAGE_VERSION}"
+  msg_info "Creating Incus container: ${CT_NAME}"
+  incus_log_section "Container Creation: ${CT_NAME}"
+  if ! incus network show "${BRG}" >/dev/null 2>&1; then
+    msg_warn "Configured network '${BRG}' not found, auto-selecting fallback"
+    BRG="$(incus_pick_default_network)"
+    msg_ok "Using network '${BRG}'"
+  fi
+  local launch_args=()
+  launch_args+=("--config" "limits.cpu=${CORE_COUNT}")
+  launch_args+=("--config" "limits.memory=${RAM_SIZE}MiB")
+  [[ -n "${PROFILE:-}" ]] && launch_args+=("--profile" "${PROFILE}")
+  launch_args+=("--network" "${BRG}")
+  [[ "$ENABLE_NESTING" == "1" ]] && launch_args+=("--config" "security.nesting=true")
+  if [[ "$UNPRIVILEGED" != "1" || "$ENABLE_FUSE" == "yes" || "$ENABLE_TUN" == "yes" ]]; then
+    launch_args+=("--config" "security.privileged=true")
+  fi
+  launch_args+=("--storage" "${STORAGE_POOL}")
+  launch_args+=("--device" "root,size=${DISK_SIZE}GiB")
+  incus launch "${image_name}" "${CT_NAME}" "${launch_args[@]}" >>"$INCUS_BUILD_LOG" 2>&1 || {
+    msg_error "Failed to create container ${CT_NAME}"; exit 1;
+  }
+  msg_ok "Created container ${CT_NAME}"
+  msg_info "Waiting for container to initialize"
+  sleep 3
+  local waited=0
+  while ! incus exec "${CT_NAME}" -- true &>/dev/null; do sleep 2; waited=$((waited + 2)); [[ "$waited" -ge 60 ]] && { msg_error "Container not ready"; exit 1; }; done
+  msg_ok "Container ${CT_NAME} is ready"
+
+  # Apply extended NIC options (closest mapping to Proxmox advanced network settings).
+  local net_reconfigure=0
+  if [[ -n "${MAC:-}" ]]; then
+    incus config device set "${CT_NAME}" eth0 hwaddr "${MAC}" >>"$INCUS_BUILD_LOG" 2>&1 || msg_warn "Could not apply MAC (${MAC})"
+    net_reconfigure=1
+  fi
+  if [[ -n "${VLAN_TAG:-}" ]]; then
+    incus config device set "${CT_NAME}" eth0 vlan "${VLAN_TAG}" >>"$INCUS_BUILD_LOG" 2>&1 || msg_warn "Could not apply VLAN (${VLAN_TAG})"
+    net_reconfigure=1
+  fi
+  if [[ -n "${MTU:-}" ]]; then
+    incus config device set "${CT_NAME}" eth0 mtu "${MTU}" >>"$INCUS_BUILD_LOG" 2>&1 || msg_warn "Could not apply MTU (${MTU})"
+    net_reconfigure=1
+  fi
+  if [[ -n "${NET:-}" && "${NET}" != "dhcp" ]]; then
+    incus config device set "${CT_NAME}" eth0 ipv4.address "${NET}" >>"$INCUS_BUILD_LOG" 2>&1 || msg_warn "Could not apply IPv4 (${NET})"
+    net_reconfigure=1
+  fi
+  if [[ -n "${IPV6_ADDR:-}" && "${IPV6_ADDR}" != "auto" ]]; then
+    incus config device set "${CT_NAME}" eth0 ipv6.address "${IPV6_ADDR}" >>"$INCUS_BUILD_LOG" 2>&1 || msg_warn "Could not apply IPv6 (${IPV6_ADDR})"
+    net_reconfigure=1
+  fi
+  if [[ -n "${TAGS:-}" ]]; then
+    incus config set "${CT_NAME}" user.tags "${TAGS}" >>"$INCUS_BUILD_LOG" 2>&1 || msg_warn "Could not apply tags"
+  fi
+
+  if [[ "$net_reconfigure" -eq 1 ]]; then
+    msg_info "Reconfiguring network settings"
+    incus restart "${CT_NAME}" >>"$INCUS_BUILD_LOG" 2>&1 || msg_warn "Restart after network reconfiguration failed"
+    msg_ok "Network settings applied"
+  fi
+
+  local container_ip; container_ip=$(incus exec "${CT_NAME}" -- hostname -I 2>/dev/null | awk '{print $1}')
+  [[ -n "$container_ip" ]] && { msg_ok "Container IP: ${container_ip}"; export IP="$container_ip"; } || { msg_warn "IP unknown, DHCP may be in progress"; export IP="unknown"; }
+}
+
+incus_inject_ssh_keys() {
+  [[ "${SSH:-no}" != "yes" ]] && return 0
+  [[ -n "${SSH_AUTHORIZED_KEY:-}" ]] && {
+    msg_info "Installing SSH key"
+    incus exec "${CT_NAME}" -- bash -c "mkdir -p /root/.ssh && chmod 700 /root/.ssh && echo '${SSH_AUTHORIZED_KEY}' > /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys" &>/dev/null
+    msg_ok "SSH key installed"
+  }
+}
+
+incus_setup_motd() {
+  msg_info "Setting up MOTD"
+  local motd_file
+  motd_file=$(mktemp)
+  cat >"$motd_file" <<MOTDEOF
+#!/bin/bash
+echo ''
+echo '  🚀 Incus Container: ${CT_NAME}'
+echo "  🖥️  OS: \$(grep ^PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d '"')"
+echo "  📡 IP: \$(hostname -I | awk '{print \$1}')"
+echo ''
+MOTDEOF
+  incus file push "$motd_file" "${CT_NAME}/etc/profile.d/incus-motd.sh" >>"$INCUS_BUILD_LOG" 2>&1
+  incus exec "${CT_NAME}" -- chmod +x /etc/profile.d/incus-motd.sh >>"$INCUS_BUILD_LOG" 2>&1
+  rm -f "$motd_file"
+  msg_ok "MOTD configured"
+}
+
+incus_build_functions_content() {
+  FUNCTIONS_FILE_PATH=""
+  FUNCTIONS_FILE_PATH=$(curl -fsSL "${INCUS_COMMUNITY_SCRIPTS_URL}/Incus/misc/incus-tools.func" 2>/dev/null || true)
+  [[ -z "$FUNCTIONS_FILE_PATH" ]] && { msg_error "Could not fetch incus-tools.func"; exit 1; }
+  export FUNCTIONS_FILE_PATH
+}
+
+incus_run_install_script() {
+  msg_info "Preparing installation"
+  incus_log_section "Application Installation: ${APP}"
+  incus_build_functions_content
+  msg_info "Pushing functions to container"
+  incus exec "${CT_NAME}" -- bash -c "cat > /tmp/incus-functions <<'INNEREOF'
+${FUNCTIONS_FILE_PATH}
+INNEREOF
+export FUNCTIONS_FILE_PATH=\$(cat /tmp/incus-functions)
+export INCUS_FUNCTIONS=\$FUNCTIONS_FILE_PATH" >>"$INCUS_BUILD_LOG" 2>&1 || { msg_error "Failed to push functions"; exit 1; }
+  msg_ok "Functions pushed"
+  msg_info "Starting application installation"
+  incus exec "${CT_NAME}" -- bash -c "
+    export FUNCTIONS_FILE_PATH=\$(cat /tmp/incus-functions)
+    export INCUS_FUNCTIONS=\"\${FUNCTIONS_FILE_PATH}\"
+    export DIAGNOSTICS='${DIAGNOSTICS:-yes}'
+    export RANDOM_UUID='${RANDOM_UUID}'
+    export EXECUTION_ID='${EXECUTION_ID}'
+    export SESSION_ID='${SESSION_ID}'
+    export VERBOSE='${VERBOSE}'
+    export STD='silent'
+    export APP='${APP}'
+    export APPLICATION='${APP}'
+    export NSAPP='${NSAPP}'
+    export app='${NSAPP}'
+    export PASSWORD='${PW:-}'
+    export CTID='${CT_NAME}'
+    export CTTYPE='1'
+    export PCT_OSTYPE='${IMAGE_OS}'
+    export PCT_OSVERSION='${IMAGE_VERSION}'
+    export PCT_DISK_SIZE='${DISK_SIZE}'
+    export tz='${tz:-UTC}'
+    export INCUS_HEADER='Incus :: ${APP}'
+    bash <(curl -fsSL '${INCUS_COMMUNITY_SCRIPTS_URL}/Incus/install/${var_install}.sh')
+  " 2>&1 | tee -a "$INCUS_BUILD_LOG" || { msg_error "Installation failed inside container"; exit 1; }
+  msg_ok "Installation completed"
+}
+
+incus_build_container() {
+  incus_ensure_whiptail_host
+  incus_base_settings
+
+  if [[ -z "${MODE:-}" ]]; then
+    if incus_can_use_whiptail; then
+      if whiptail --backtitle "Incus Helper Scripts" --title "SETTINGS" --yesno "Use Default Settings?" --no-button "Advanced" 10 58; then
+        MODE="default"
+        METHOD="default"
+        msg_custom "⚙️" "${BL}" "Using Default Settings"
+      else
+        MODE="advanced"
+        METHOD="advanced"
+        msg_custom "🧩" "${RD}" "Using Advanced Settings"
+      fi
+    elif prompt_confirm "Use Default Settings? (No = Advanced)" "y" 60; then
+      MODE="default"
+      METHOD="default"
+      msg_custom "⚙️" "${BL}" "Using Default Settings"
+    else
+      MODE="advanced"
+      METHOD="advanced"
+      msg_custom "🧩" "${RD}" "Using Advanced Settings"
+    fi
+  fi
+
+  if [[ "${MODE:-default}" == "advanced" || "${var_advanced:-no}" == "yes" ]]; then
+    advanced_settings
+  fi
+
+  # Pre-flight is disabled by default for now. Enable only when explicitly requested.
+  if [[ "${INCUS_RUN_PRECHECKS:-0}" == "1" || "${var_prechecks:-no}" == "yes" ]]; then
+    incus_run_preflight
+  elif [[ "${INCUS_SKIP_PRECHECKS:-0}" == "1" || "${var_skip_prechecks:-no}" == "yes" ]]; then
+    msg_warn "Skipping Incus pre-flight checks (requested)"
+  else
+    msg_warn "Skipping Incus pre-flight checks (default)"
+  fi
+
+  incus_echo_config
+  [[ "${MODE:-default}" != "advanced" ]] && { echo -e "\n${INFO}${YW}Press Enter to create the container or Ctrl+C to abort...${CL}"; read -r; }
+  incus_create_container
+  incus_inject_ssh_keys
+  incus_setup_motd
+  incus_run_install_script
+  msg_ok "Container ${CT_NAME} successfully created with ${APP}!"
+}
+
+# ==============================================================================
+# SECTION 4: UPDATE SUPPORT
+# ==============================================================================
+
+incus_check_container_storage() {
+  local required_mb="${1:-500}" available_mb
+  available_mb=$(df -m / | awk 'NR==2 {print $4}')
+  [[ "$available_mb" -lt "$required_mb" ]] && { msg_error "Insufficient storage: ${available_mb}MB < ${required_mb}MB"; exit 1; }
+}
+
+incus_check_container_resources() {
+  local available_ram; available_ram=$(free -m | awk 'NR==2 {print $7}')
+  [[ "$available_ram" -lt 256 ]] && msg_warn "Low memory: ${available_ram}MB"
+}
+
+# ==============================================================================
+# SECTION 5: MAINTENANCE
+# ==============================================================================
+
+incus_container_shell() { incus exec "${1:-$CT_NAME}" -- bash; }
+incus_container_logs() { incus info --show-log "${1:-$CT_NAME}" 2>/dev/null | tail -50; }
+
+incus_delete_container() {
+  local name="$1"
+  incus_container_exists "$name" || { msg_error "Container ${name} does not exist"; return 1; }
+  msg_warn "About to delete: ${name}"; echo -ne "${INFO}${YW}Type 'yes' to confirm: ${CL}"; read -r confirm
+  [[ "$confirm" != "yes" ]] && { msg_ok "Cancelled"; return 0; }
+  msg_info "Stopping ${name}"; incus stop "$name" --force &>/dev/null || true; msg_ok "Stopped"
+  msg_info "Deleting ${name}"; incus delete "$name" &>/dev/null; msg_ok "Deleted"
+}
+
+# ==============================================================================
+# SECTION 6: START FUNCTIONS
+# ==============================================================================
+
+incus_start() {
+  incus_shell_check
+  incus_root_check
+  incus_check
+  clear
+}
+
+incus_description() {
+  echo ""
+  echo -e "${BL}╔══════════════════════════════════════════════════════════════╗${CL}"
+  echo -e "${BL}║${CL}  ${BOLD}${APP} Installation Complete${CL}"
+  echo -e "${BL}╠══════════════════════════════════════════════════════════════╣${CL}"
+  echo -e "${BL}║${CL}  Container: ${GN}${CT_NAME}${CL}"
+  echo -e "${BL}║${CL}  Access: ${GN}incus exec ${CT_NAME} -- bash${CL}"
+  echo -e "${BL}║${CL}  Shell: ${GN}incus shell ${CT_NAME}${CL}"
+  echo -e "${BL}║${CL}  Logs: ${GN}incus info --show-log ${CT_NAME}${CL}"
+  echo -e "${BL}║${CL}  Stop: ${GN}incus stop ${CT_NAME}${CL}"
+  echo -e "${BL}║${CL}  Delete: ${GN}incus delete ${CT_NAME}${CL}"
+  echo -e "${BL}╚══════════════════════════════════════════════════════════════╝${CL}"
+  echo ""
+}
+
+# ==============================================================================
+# SECTION 7: INSTALL HELPERS (run inside container)
+# ==============================================================================
+
+incus_prepare_install_env() {
+  msg_info "Preparing environment"
+  incus_silent apt update
+  incus_silent apt install -y curl wget gnupg ca-certificates
+  msg_ok "Environment prepared"
+}
+
+incus_network_check() {
+  msg_info "Checking network"
+  local i=0
+  while [[ $i -lt 10 ]]; do
+    ping -c 1 -W 2 8.8.8.8 &>/dev/null && { msg_ok "Network available"; return 0; }
+    sleep 2; ((i++))
+  done
+  msg_error "No network connectivity"; exit 1
+}
+
+incus_update_os() {
+  msg_info "Updating OS"
+  incus_silent apt update
+  incus_silent apt upgrade -y
+  msg_ok "OS updated"
+}
+
+# ==============================================================================
+# SECTION 8: BUILD.FUNC COMPATIBILITY HELPERS
+# ==============================================================================
+
+base_settings() { incus_base_settings; }
+run_preflight() { incus_run_preflight; }
+create_lxc_container() { incus_create_container; }
+install_script() { incus_run_install_script; }
+check_container_storage() { incus_check_container_storage "$@"; }
+check_container_resources() { incus_check_container_resources "$@"; }
+echo_default() { incus_echo_config; }
+destroy_lxc() { incus_delete_container "${1:-$CT_NAME}"; }
+update_motd_ip() { command -v update_motd_ip >/dev/null 2>&1 && update_motd_ip || true; }
+ensure_log_on_host() { :; }
+api_exit_script() { :; }
+dev_mode_menu() { msg_warn "dev_mode_menu is not implemented for Incus build flow"; }
+diagnostics_menu() { msg_warn "diagnostics_menu is not implemented for Incus build flow"; }
+settings_menu() { msg_warn "settings_menu is not implemented for Incus build flow"; }
+
+incus_advanced_step_selection() {
+  if ! incus_can_use_whiptail; then
+    echo "fallback"
+    return
+  fi
+
+  whiptail --backtitle "Incus Helper Scripts" --title "ADVANCED SETTINGS STEPS" --checklist \
+    "Choose the steps you want to edit" 24 86 16 \
+    "name" "Container Name" ON \
+    "cpu" "CPU Cores" ON \
+    "ram" "RAM (MiB)" ON \
+    "disk" "Disk (GiB)" ON \
+    "profile" "Incus Profile" ON \
+    "network" "Network Bridge" ON \
+    "ip4" "IPv4 Address/DHCP" ON \
+    "ip6" "IPv6 Address/Auto" OFF \
+    "mac" "MAC Address" OFF \
+    "vlan" "VLAN Tag" OFF \
+    "mtu" "MTU" OFF \
+    "storage" "Storage Pool" ON \
+    "tags" "Tags" ON \
+    "features" "Nesting/FUSE/TUN/GPU/Privileged" ON \
+    "ssh" "SSH Key Injection" OFF \
+    "preflight" "Run Preflight Checks" OFF \
+    3>&1 1>&2 2>&3 || true
+}
+
+advanced_settings() {
+  stop_spinner
+  log_msg "[INFO] Applying advanced settings"
+
+  INCUS_RUN_PRECHECKS=0
+  export INCUS_RUN_PRECHECKS
+
+  local selected
+  selected="$(incus_advanced_step_selection)"
+
+  if [[ "$selected" == "fallback" ]]; then
+    selected='"name" "cpu" "ram" "disk" "profile" "network" "ip4" "ip6" "mac" "vlan" "mtu" "storage" "tags" "features" "ssh"'
+  fi
+
+  local has_step
+  has_step() { [[ " $selected " == *" \"$1\" "* ]]; }
+
+  local v
+  if has_step "name"; then
+    v=$(incus_prompt_input "CONTAINER NAME" "Container Name" "${CT_NAME}")
+    [[ -n "$v" ]] && CT_NAME=$(echo "${v,,}" | tr -d ' ' | tr '_' '-')
+  fi
+
+  if has_step "cpu"; then
+    v=$(incus_prompt_input "CPU CORES" "CPU Cores" "${CORE_COUNT}")
+    [[ "$v" =~ ^[0-9]+$ ]] && CORE_COUNT="$v" || msg_warn "Invalid CPU value, keeping ${CORE_COUNT}"
+  fi
+
+  if has_step "ram"; then
+    v=$(incus_prompt_input "RAM" "RAM (MiB)" "${RAM_SIZE}")
+    [[ "$v" =~ ^[0-9]+$ ]] && RAM_SIZE="$v" || msg_warn "Invalid RAM value, keeping ${RAM_SIZE}"
+  fi
+
+  if has_step "disk"; then
+    v=$(incus_prompt_input "DISK" "Disk (GiB)" "${DISK_SIZE}")
+    [[ "$v" =~ ^[0-9]+$ ]] && DISK_SIZE="$v" || msg_warn "Invalid Disk value, keeping ${DISK_SIZE}"
+  fi
+
+  if has_step "profile"; then
+    v=$(incus_prompt_input "PROFILE" "Profile" "${PROFILE}")
+    [[ -n "$v" ]] && PROFILE="$v"
+  fi
+
+  if has_step "network"; then
+    BRG="$(incus_select_network "${BRG}")"
+    echo -e "${BRIDGE}${BOLD}${DGN}Network Bridge: ${BGN}${BRG}${CL}"
+  fi
+
+  if has_step "ip4"; then
+    v=$(incus_prompt_input "IPV4" "IPv4 (dhcp or x.x.x.x)" "${NET}")
+    [[ -n "$v" ]] && NET="$v"
+  fi
+
+  if has_step "ip6"; then
+    v=$(incus_prompt_input "IPV6" "IPv6 (auto/none/or address)" "${IPV6_ADDR}")
+    [[ -n "$v" ]] && IPV6_ADDR="$v"
+  fi
+
+  if has_step "mac"; then
+    v=$(incus_prompt_input "MAC" "MAC Address (empty=auto)" "${MAC}")
+    [[ -n "$v" ]] && MAC="$v"
+  fi
+
+  if has_step "vlan"; then
+    v=$(incus_prompt_input "VLAN" "VLAN Tag (empty=none)" "${VLAN_TAG}")
+    [[ -n "$v" ]] && VLAN_TAG="$v"
+  fi
+
+  if has_step "mtu"; then
+    v=$(incus_prompt_input "MTU" "MTU (empty=default)" "${MTU}")
+    [[ -n "$v" ]] && MTU="$v"
+  fi
+
+  if has_step "storage"; then
+    v=$(incus_prompt_input "STORAGE" "Storage Pool" "${STORAGE_POOL}")
+    [[ -n "$v" ]] && STORAGE_POOL="$v"
+  fi
+
+  if has_step "tags"; then
+    v=$(incus_prompt_input "TAGS" "Tags (; separated)" "${TAGS}")
+    [[ -n "$v" ]] && TAGS="$v"
+  fi
+
+  if has_step "features"; then
+    if incus_prompt_confirm "FEATURE" "Enable nesting?" "$([[ "${ENABLE_NESTING}" == "1" ]] && echo y || echo n)"; then ENABLE_NESTING=1; else ENABLE_NESTING=0; fi
+    if incus_prompt_confirm "FEATURE" "Enable FUSE?" "$([[ "${ENABLE_FUSE}" == "yes" ]] && echo y || echo n)"; then ENABLE_FUSE=yes; else ENABLE_FUSE=no; fi
+    if incus_prompt_confirm "FEATURE" "Enable TUN?" "$([[ "${ENABLE_TUN}" == "yes" ]] && echo y || echo n)"; then ENABLE_TUN=yes; else ENABLE_TUN=no; fi
+    if incus_prompt_confirm "FEATURE" "Enable GPU passthrough flag?" "$([[ "${ENABLE_GPU}" == "yes" ]] && echo y || echo n)"; then ENABLE_GPU=yes; else ENABLE_GPU=no; fi
+    if incus_prompt_confirm "FEATURE" "Use unprivileged container?" "$([[ "${UNPRIVILEGED}" == "1" ]] && echo y || echo n)"; then UNPRIVILEGED=1; else UNPRIVILEGED=0; fi
+  fi
+
+  if has_step "ssh"; then
+    if incus_prompt_confirm "SSH" "Inject SSH key?" "$([[ "${SSH}" == "yes" ]] && echo y || echo n)"; then
+      SSH=yes
+      if [[ -z "${SSH_AUTHORIZED_KEY:-}" ]]; then
+        v=$(incus_prompt_input "SSH KEY" "Public SSH key (single line)" "")
+        [[ -n "$v" ]] && SSH_AUTHORIZED_KEY="$v"
+      fi
+    else
+      SSH=no
+    fi
+  fi
+
+  if has_step "preflight"; then
+    INCUS_RUN_PRECHECKS=1
+  elif [[ "$selected" == "fallback" ]]; then
+    if incus_prompt_confirm "PREFLIGHT" "Run pre-flight checks?" "n"; then
+      INCUS_RUN_PRECHECKS=1
+    fi
+  else
+    INCUS_RUN_PRECHECKS=0
+  fi
+
+  msg_ok "Applied advanced settings"
+}
+edit_default_storage() { msg_warn "edit_default_storage is not implemented for Incus build flow"; }
+configure_ssh_settings() { :; }
+ensure_storage_selection_for_vars_file() { :; }
+ensure_global_default_vars_file() { :; }
+choose_and_set_storage_for_file() { :; }
+_write_storage_to_vars() { :; }
+resolve_storage_preselect() { :; }
+check_storage_support() { return 0; }
+select_storage() { return 0; }
+validate_storage_space() { return 0; }
+default_var_settings() { :; }
+load_vars_file() { :; }
+get_app_defaults_path() { echo ""; }
+_is_whitelisted_key() { return 0; }
+_sanitize_value() { echo "${1:-}"; }
+_load_vars_file_to_map() { :; }
+_build_vars_diff() { :; }
+_build_current_app_vars_tmp() { :; }
+maybe_offer_save_app_defaults() { :; }
+fix_gpu_gids() { :; }
+msg_menu() { msg_info "${1:-Incus menu not required in non-interactive flow}"; }
+diagnostics_check() { return 0; }
+install_ssh_keys_into_ct() { incus_inject_ssh_keys; }
+find_host_ssh_keys() { :; }
+ssh_extract_keys_from_file() { :; }
+ssh_build_choices_from_files() { :; }
+ssh_discover_default_files() { :; }
+
+preflight_pass() { msg_ok "$1"; }
+preflight_warn() { msg_warn "$1"; }
+preflight_fail() { msg_error "$1"; return 1; }
+preflight_maxkeys() { return 0; }
+preflight_storage_rootdir() { return 0; }
+preflight_storage_vztmpl() { return 0; }
+preflight_storage_space() { return 0; }
+preflight_network_bridge() { return 0; }
+preflight_dns_resolution() { return 0; }
+preflight_repo_access() { return 0; }
+preflight_cluster_quorum() { return 0; }
+preflight_lxc_stack() { return 0; }
+preflight_container_id() { return 0; }
+preflight_template_connectivity() { return 0; }
+preflight_template_available() { return 0; }
+
+validate_container_id() {
+  [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+}
+
+get_valid_container_id() {
+  echo "${1:-$CT_NAME}"
+}
+
+validate_hostname() {
+  local hostname="${1:-}"
+  [[ -n "$hostname" ]] || return 1
+  [[ "$hostname" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}$ ]]
+}
+
+validate_mac_address() {
+  local mac="${1:-}"
+  [[ "$mac" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]
+}
+
+validate_vlan_tag() {
+  local tag="${1:-}"
+  [[ "$tag" =~ ^[0-9]+$ ]] || return 1
+  ((tag >= 0 && tag <= 4094))
+}
+
+validate_mtu() {
+  local mtu="${1:-}"
+  [[ "$mtu" =~ ^[0-9]+$ ]] || return 1
+  ((mtu >= 576 && mtu <= 9216))
+}
+
+validate_ipv6_address() {
+  local ip="${1:-}"
+  [[ "$ip" == "dhcp" || "$ip" == "auto" || "$ip" == "none" ]] && return 0
+  [[ "$ip" =~ : ]]
+}
+
+validate_bridge() {
+  local bridge="${1:-}"
+  [[ -z "$bridge" ]] && return 1
+  incus network show "$bridge" >/dev/null 2>&1
+}
+
+validate_ip_address() {
+  local ip="${1:-}"
+  [[ "$ip" == "dhcp" ]] && return 0
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]
+}
+
+validate_gateway_ip() {
+  local ip="${1:-}"
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+}
+
+validate_gateway_in_subnet() { return 0; }
+validate_timezone() { [[ -n "${1:-}" ]]; }
+
+validate_tags() {
+  local tags="${1:-}"
+  [[ -z "$tags" ]] && return 0
+  [[ "$tags" =~ ^[a-zA-Z0-9._-]+(\;[a-zA-Z0-9._-]+)*$ ]]
+}
+
+ip_to_int() {
+  local a b c d
+  IFS=. read -r a b c d <<<"${1:-0.0.0.0}"
+  echo $((a * 256 ** 3 + b * 256 ** 2 + c * 256 + d))
+}
+
+int_to_ip() {
+  local ip=${1:-0}
+  echo "$(((ip >> 24) & 255)).$(((ip >> 16) & 255)).$(((ip >> 8) & 255)).$((ip & 255))"
+}
+
+is_ip_range() { [[ "${1:-}" == *-* ]]; }
+
+resolve_ip_from_range() {
+  local range="${1:-}"
+  if [[ "$range" =~ ^([0-9]+\.[0-9]+\.[0-9]+\.)([0-9]+)-([0-9]+)$ ]]; then
+    local base="${BASH_REMATCH[1]}"
+    local start="${BASH_REMATCH[2]}"
+    echo "${base}${start}"
+    return 0
+  fi
+  echo "$range"
+}
+
+get_current_ip() {
+  command -v get_lxc_ip >/dev/null 2>&1 && get_lxc_ip || hostname -I 2>/dev/null | awk '{print $1}'
+}
+
+# ==============================================================================
+# SECTION 9: BARE FUNCTION ALIASES (for CT script compatibility)
+# ==============================================================================
+#
+# These aliases allow CT scripts to use the same function names as Proxmox
+# scripts (start, build_container, description, variables) without
+# modification. color, catch_errors, header_info are already provided by
+# incus_install_compat_aliases in incus-core.func / incus-tools.func.
+# ==============================================================================
+
+# start() - Handles both host (create) and container (update) contexts
+start() {
+  if command -v incus &>/dev/null && [[ -z "${_INCUS_INSIDE_CONTAINER:-}" ]]; then
+    # Running on Incus host - proceed to build_container
+    return 0
+  else
+    # Running inside container - update mode
+    VERBOSE=${var_verbose:-"no"}
+    if [[ "${VERBOSE}" == "yes" ]]; then
+      STD=""
+    else
+      STD="silent"
+    fi
+    ensure_profile_loaded
+    update_script
+    cleanup_lxc
+  fi
+}
+
+# build_container() - Creates Incus container and runs install script
+build_container() {
+  incus_build_container
+}
+
+# description() - Shows completion summary
+description() {
+  incus_description
+}
+
+# variables() - Initializes variables (alias for incus_variables)
+variables() {
+  incus_variables
+}

@@ -45,6 +45,8 @@ function update_script() {
     source "$HOME/.cargo/env"
     $STD rustup target add wasm32-unknown-unknown
     cd /opt/aliasvault/core
+    # Strip year-hardcoded test step from per-package build.sh (upstream bug)
+    find /opt/aliasvault/core -name build.sh -exec sed -i 's/npm run test &&[[:space:]]*//g' {} +
     $STD bash build-and-distribute.sh --browser
     msg_ok "Built Core Libraries"
 
@@ -100,7 +102,7 @@ description
 
 msg_ok "Completed Successfully!\n"
 echo -e "${CREATING}${GN}${APP} setup has been successfully initialized!${CL}"
-echo -e "${INFO}${YW} Access it using the following URL:${CL}"
-echo -e "${TAB}${GATEWAY}${BGN}https://${IP}${CL}"
-echo -e "${INFO}${YW} Admin Panel:${CL} ${TAB}${GATEWAY}${BGN}https://${IP}/admin${CL}"
+echo -e "${INFO}${YW}Access it using the following URL:${CL}"
+echo -e "${GATEWAY}${BGN}https://${IP}${CL}"
+echo -e "${INFO}${YW} Admin Panel:${CL} ${GATEWAY}${BGN}https://${IP}/admin${CL}"
 echo -e "${INFO}${YW} Admin credentials were shown in the installation output above.${CL}"
